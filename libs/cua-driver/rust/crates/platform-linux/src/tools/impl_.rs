@@ -1200,7 +1200,6 @@ impl Tool for GetWindowStateTool {
             .and_then(|v| v.as_u64())
             .map(|v| v.max(1) as usize);
         let timeout_ms = cua_driver_core::tool_schema::resolve_timeout_ms(args.get("timeout_ms"));
-        let walk_timeout = std::time::Duration::from_millis(timeout_ms);
 
         let process_is_live = crate::proc_fs::is_process_live(pid);
         // Enumerate the pid's windows ONCE and reuse the result for both the
@@ -1271,6 +1270,17 @@ impl Tool for GetWindowStateTool {
         let state = self.state.clone();
         let state_for_capture = state.clone();
         let query_for_walk = query.clone();
+        // Walking the tree and acting on a pixel are different budgets. A caller
+        // that set `timeout_ms` means it for both; a caller that set nothing gets
+        // the generic 1s ACTION default, which times the walk out before a large
+        // GTK tree (Firefox) finishes and returns a 2-element frame that reads as
+        // "this app has no controls" when the real tree has hundreds. So an
+        // unset timeout falls back to the walker's own budget.
+        let walk_timeout = if args.get("timeout_ms").is_some() {
+            std::time::Duration::from_millis(timeout_ms)
+        } else {
+            crate::atspi::DEFAULT_WALK_TIMEOUT
+        };
 
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             // Skip the AT-SPI walk on the capture-only path
@@ -7260,6 +7270,38 @@ impl Tool for TypeTextTool {
             }
         };
         let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
+        // A modal dialog owned by another application owns the keyboard focus.
+        // A background write aimed at this window is delivered to the dialog
+        // (or dropped) and the verdict still reads "unverifiable", so the agent
+        // retries into the dialog. Refuse, and name the blocker.
+        if !delivery.is_foreground() {
+            if let Some(blocker) = crate::input::blockers::blocking_modal_dialog(pid) {
+                let target = crate::x11::window_info(xid)
+                    .map(|w| {
+                        format!(
+                            "{} (window_id {}, pid {})",
+                            w.app_name,
+                            w.xid,
+                            w.pid.map(|p| p.to_string()).unwrap_or_default()
+                        )
+                    })
+                    .unwrap_or_else(|| format!("window_id {xid}, pid {pid}"));
+                return ToolResult::text(format!(
+                    "Refused: {}. The target is {target}; the dialog is a different window, so \
+                     typing into the target would not land. Resolve the dialog first: \
+                     get_window_state(pid={}, window_id={}) to see its controls, then act on it.",
+                    blocker.describe(),
+                    blocker.pid.unwrap_or(0),
+                    blocker.window_id
+                ))
+                .with_structured(json!({
+                    "code": "modal_dialog_blocks_input",
+                    "effect": "refused",
+                    "target": { "pid": pid, "window_id": xid },
+                    "blocker": blocker.to_json(),
+                }));
+            }
+        }
         if isolated_hyprland_background(delivery)
             && resolved_elem_idx.is_none()
             && args.get("x").is_none()
