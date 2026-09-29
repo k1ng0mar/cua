@@ -1312,8 +1312,17 @@ impl Tool for GetWindowStateTool {
             } else {
                 window_overlays(pid, xid)
             };
+            // A window the WM left UNMAPPED (iconified, on another workspace,
+            // a minimized Chromium tab) is not viewable, and X11 refuses
+            // GetImage on a non-viewable drawable: XShm, XGetImage and
+            // ImageMagick all fail with `Match` / "bad window" and the whole
+            // capture is reported as a backend failure. That reads like a
+            // driver bug but is a state problem, so fall back to a root-region
+            // crop of the window's own rectangle, and label the frame so the
+            // caller knows it may not show this window's contents.
+            let viewable = !crate::wayland::is_wayland() && crate::x11::window_is_viewable(xid);
             let screenshot = if should_capture {
-                let captured = if overlays.covers_window {
+                let captured = if overlays.covers_window || !viewable {
                     overlays
                         .window_rect
                         .ok_or_else(|| anyhow::anyhow!("window geometry unavailable"))
@@ -1386,12 +1395,12 @@ impl Tool for GetWindowStateTool {
             } else {
                 None
             };
-            Ok((tree_result, screenshot, bounds, screenshot_error, overlays))
+            Ok((tree_result, screenshot, bounds, screenshot_error, overlays, viewable))
         })
         .await;
 
         match result {
-            Ok(Ok((tree_opt, shot_opt, bounds, screenshot_error, overlays))) => {
+            Ok(Ok((tree_opt, shot_opt, bounds, screenshot_error, overlays, viewable))) => {
                 let mut content = Vec::new();
                 let mut structured = json!({ "window_id": xid, "pid": pid });
                 let screenshot_scale = shot_opt.as_ref().map(|(_, _, w, _, original_w, _)| {
@@ -1642,7 +1651,18 @@ impl Tool for GetWindowStateTool {
                     }
                     structured["screenshot_width"] = json!(w);
                     structured["screenshot_height"] = json!(h);
-                    structured["screenshot_frame_valid"] = json!(true);
+                    structured["screenshot_frame_valid"] = json!(viewable);
+                    if !viewable {
+                        // The frame is a crop of the screen at the window's
+                        // rectangle, not this window's own drawable. Say so, or
+                        // the agent reads whatever is stacked over it as if it
+                        // were the app's UI.
+                        structured["screenshot_source"] = json!("root_region_fallback");
+                        structured["screenshot_note"] = json!(
+                            "window is not viewable (unmapped/iconified/off-workspace); the frame is a \
+                             screen crop at the window's rectangle and may show other windows"
+                        );
+                    }
                     if let Some(ow) = orig_w {
                         if ow > 0 {
                             structured["frame_scale"] = json!(w as f64 / ow as f64);
